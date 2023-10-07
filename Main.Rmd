@@ -1,0 +1,1634 @@
+---
+title: "预测模型建模"
+---
+
+
+```{r 引入包}
+library(MASS)
+library(leaps)
+library(glmnet)
+library(magrittr)
+library(readxl)
+library(pROC)
+library(caret)
+library(dplyr)
+```
+
+调用自定义函数
+```{r 调用自定义函数}
+source("~/My_functions/my_functions.R")
+```
+
+
+样本量计算 for criterion B3
+```{r 样本量计算 for criterion B3}
+parameters<-25
+Outcome_proportion<-0.15
+Arbitrary_sample_size <-100
+E<-Outcome_proportion*Arbitrary_sample_size
+n<-Arbitrary_sample_size
+InLnull<-E*log(E/n)+(n-E)*log(1-E/n)
+max_Rsq<-1-exp(2*InLnull/n)
+max_Rsq
+
+explain<-0.15 #If we assume, conservatively, that the new model will explain 15% of the variability
+
+anticipated_Rsq<-round(explain*max_Rsq,2)
+
+anticipated_Rsq
+
+message <- paste("在Stata中输入: pmsampsize, type(b) rsquared(", anticipated_Rsq, ") parameters(", parameters, ") prevalence(", Outcome_proportion, ")", sep = "")
+
+cat(message)
+
+```
+
+样本量计算 for criterion B2
+```{r 样本量计算 for criterion B2}
+Sample_size<-exp((-0.508+0.259*log(Outcome_proportion)+0.504*log(parameters)-log(0.05))/0.544)
+Sample_size
+EPP<-Sample_size*Outcome_proportion/10
+EPP
+```
+
+数据导入初步处理
+```{r 数据导入初步处理}
+# 读取Excel数据
+data <- read_excel("~/建模/人群队列.xlsx")
+dim(data) #703 170
+
+# 指定需要转换的列索引
+continuous_cols <- 4:43
+
+# 将连续变量列定义为数值型
+data[, continuous_cols] <- apply(data[, continuous_cols], 2, as.numeric, na.strings = "")
+# 将因子变量列转换为因子型
+factor_cols <- setdiff(names(data), names(data[, continuous_cols]))
+data[, factor_cols] <- lapply(data[, factor_cols], as.factor)
+
+# 将"诊断年龄"变量转换为因子变量
+data$诊断年龄 <- ifelse(data$诊断年龄 >= 40, 1, 0)
+data$诊断年龄 <- as.factor(data$诊断年龄)
+
+# 将"BMI"变量转换为因子变量
+data$BMI <- ifelse(data$BMI >= 24, 1, 0)
+data$BMI <- as.factor(data$BMI)
+
+dim(data) #703 171
+
+subset_data <- data[, !(names(data) %in% c("活动后气短_活动耐力下降", 
+               "心悸","既往肺动脉高压","出院_冠心病冠脉狭窄","右房径0减小_1正常_2增大",
+               "CRP升高","咳嗽","出院_心脏扩大"))]
+data<-subset_data
+dim(data) #703 168
+
+```
+
+
+处理缺失值
+```{r 处理缺失值}
+# 找出存在缺失值的变量名
+variables_with_missing <- names(data)[colSums(is.na(data)) > 0]
+length(variables_with_missing)
+
+# 计算缺失值比例
+missing_proportions <- colSums(is.na(data[, variables_with_missing])) / nrow(data) * 100
+
+# 创建数据框存储变量名和缺失值比例
+missing_data_summary <- data.frame(Variable = variables_with_missing, Missing_Proportion = missing_proportions)
+# 可视化缺失值比例
+library(ggplot2)
+ggplot(missing_data_summary, aes(x = reorder(Variable, Missing_Proportion), y = Missing_Proportion)) +
+  geom_bar(stat = "identity", fill = "skyblue", width = 0.5) +
+  labs(x = "Variable", y = "Missing Proportion (%)") +
+  ggtitle("Missing Data Summary") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+# 找到缺失比例超过5%的变量名
+variables_to_remove <- names(missing_proportions[missing_proportions > 5])
+length(variables_to_remove)
+
+# 从数据中删除缺失比例超过5%的变量
+data <- data[, !(names(data) %in% variables_to_remove)]
+dim(data) #703 158
+
+variables_with_missing <- names(data)[colSums(is.na(data)) > 0]
+length(variables_with_missing)
+
+# 多重插补缺失值
+library(mice)
+imputed_data <- mice(data[, variables_with_missing], method = "pmm", m = 5, maxit = 50)
+
+# 获取事件记录
+event_logs <- imputed_data$log
+
+# 查看事件记录
+summary(event_logs)
+str(event_logs)
+
+# 获取插补后的数据
+imputed_data_complete <- complete(imputed_data)
+sapply(imputed_data_complete, class)
+
+# 检查是否仍存在缺失值
+variables_with_remaining_missing <- names(imputed_data_complete)[colSums(is.na(imputed_data_complete)) > 0]
+
+# 如果仍存在缺失值，则使用均值插补法填充缺失值
+if (length(variables_with_remaining_missing) > 0) {
+  for (var in variables_with_remaining_missing) {
+    mean_value <- mean(imputed_data_complete[[var]], na.rm = TRUE)
+    imputed_data_complete[[var]][is.na(imputed_data_complete[[var]])] <- mean_value
+  }
+}
+
+# 获取需要替换的列的列名
+variables_to_replace <- names(imputed_data_complete)
+# 替换原始数据中的相关列
+data[, variables_to_replace] <- imputed_data_complete[, variables_to_replace]
+
+# 找出存在缺失值的变量名
+variables_with_missing <- names(data)[colSums(is.na(data)) > 0]
+variables_with_missing
+
+subset_data <- data[, !(names(data) %in% c("二尖瓣狭窄1轻_2中_3重", "三尖瓣狭窄1轻_2中_3重"))]
+data<-subset_data
+dim(data) #703 156
+
+# 找出存在缺失值的变量名
+variables_with_missing <- names(data)[colSums(is.na(data)) > 0]
+variables_with_missing
+
+```
+
+
+查看data中所有变量的类型和因子水平，并将其输出到一个表格
+```{r 查看data中所有变量的类型和因子水平，并将其输出到一个表格}
+# 创建一个空的数据框用于存储结果
+variable_info <- data.frame(Variable = character(), Type = character(), Levels = character(), stringsAsFactors = FALSE)
+
+# 遍历data中的每个变量
+for (variable in names(data)) {
+  # 获取变量类型
+  variable_type <- class(data[[variable]])
+  
+  # 如果变量是因子型，获取因子水平
+  if (is.factor(data[[variable]])) {
+    factor_levels <- levels(data[[variable]])
+    num_levels <- length(factor_levels)
+  } else {
+    factor_levels <- ""
+    num_levels <- ""
+  }
+  
+  # 将变量信息添加到结果数据框
+  variable_info <- rbind(variable_info, data.frame(Variable = variable, Type = variable_type, Levels = paste(factor_levels, collapse = ","), Num_Levels = num_levels, stringsAsFactors = FALSE))
+}
+
+# 打印结果数据框
+print(variable_info)
+
+```
+
+去除只含有一个因子水平的变量
+```{r 去除只含有一个因子水平的变量}
+# 获取Num_Levels为1的变量名
+removed_variables <- variable_info$Variable[variable_info$Num_Levels == 1]
+
+# 从data中删除对应的列
+data <- data[, !names(data) %in% removed_variables]
+
+# 打印删除的变量名
+print(removed_variables)
+dim(data)
+```
+
+
+去除近似零变量
+```{r 去除近似零变量}
+library(caret)
+nzv <- nearZeroVar(data, saveMetrics= TRUE)
+nzv[nzv$nzv,]
+
+nzv <- nearZeroVar(data)
+filteredDescr <- data[, -nzv]
+dim(filteredDescr)
+```
+
+
+```{r 去除近似零变量}
+data<-filteredDescr
+dim(data)
+
+save(data,file="~/建模/Data/data.rdata")
+
+```
+
+
+导入存储的数据
+```{r 导入存储的数据}
+
+load("~/建模/Data/available_models.rdata")
+load("~/建模/Data/available_seeds.rdata")
+load("~/建模/Data/brier_table.rdata")
+load("~/建模/Data/BSR_variable_combinations.rdata")
+load("~/建模/Data/candidate_variables.rdata")
+load("~/建模/Data/classification_table.rdata")
+load("~/建模/Data/data.rdata")
+load("~/建模/Data/fit_models.rdata")
+load("~/建模/Data/LASSO_variable_combinations.rdata")
+load("~/建模/Data/LASSO_variable_combinations.rdata")
+load("~/建模/Data/results_df.rdata")
+load("~/建模/Data/significant_variables.rdata")
+
+```
+
+
+根据患者分组列将数据分为发现队列和验证队列
+```{r 根据患者分组列将数据分为发现队列和验证队列}
+discover_queue <- data[data$Group == "Discover", ]
+validation_queue <- data[data$Group == "Validation", ]
+```
+
+
+预测模型变量筛选，方法一：批量单因素筛选P<0.05的变量
+```{r 预测模型变量筛选，方法一：批量单因素筛选P<0.05的变量}
+significant_variables <- c()
+
+# 将age_enrolled和Gender_male1添加到significant_variables
+significant_variables <- c(significant_variables, "诊断年龄")
+
+# 将字符变量转换为列索引
+exclude_cols <- c(1, 2, which(names(discover_queue) %in% c("诊断年龄")))
+
+# 遍历其他因子变量进行回归和p值检验
+for (col in names(discover_queue)[-exclude_cols]) {
+  # 检查变量是否是因子变量且水平数大于等于2
+  if (is.factor(discover_queue[[col]]) && length(unique(discover_queue[[col]])) >= 2) {
+    formula <- as.formula(paste("Outcome ~", col))
+    model <- glm(formula, data = discover_queue, family = binomial)
+    p_value <- summary(model)$coefficients[2, 4]
+    
+    if (p_value < 0.05) {
+      significant_variables <- c(significant_variables, col)
+    }
+  }
+}
+
+significant_variables
+```
+
+
+可视化单因素回归的变量
+```{r 可视化单因素回归的变量}
+# 创建一个空的结果列表
+regression_results <- list()
+
+# 使用循环遍历significant_variables中的每个变量
+for (variable in significant_variables) {
+  # 构建回归模型
+  formula <- as.formula(paste("Outcome ~", variable))
+  model <- glm(formula, data = discover_queue, family = binomial)
+  
+  # 获取变量的beta值和可信区间
+  coef_summary <- confint(model)[2, ]  # 获取变量的可信区间
+  
+  # 提取beta值、下限和上限
+  beta_value <- coef(model)[2]
+  lower_ci <- coef_summary[1]
+  upper_ci <- coef_summary[2]
+  
+  # 将结果存储到回归结果列表中
+  regression_results[[variable]] <- list(beta_value = beta_value, lower_ci = lower_ci, upper_ci = upper_ci)
+}
+
+# 将回归结果转换为数据框格式
+result_df <- data.frame(Variable = names(regression_results),
+                        Beta_Values = sapply(regression_results, function(x) x$beta_value),
+                        Lower_CI = sapply(regression_results, function(x) x$lower_ci),
+                        Upper_CI = sapply(regression_results, function(x) x$upper_ci),
+                        stringsAsFactors = FALSE)
+
+# 按照beta值从大到小排序
+#result_df <- result_df[order(-result_df$Beta_Values), ]
+result_df <- result_df[order(result_df$Beta_Values), ]
+
+# 将Variable变量转换为有序因子
+result_df$Variable <- factor(result_df$Variable, levels = result_df$Variable)
+
+# 使用森林图进行可视化
+library(ggplot2)
+library(extrafont)
+
+# 加载 Times New Roman 字体
+
+ggplot(result_df, aes(x = Beta_Values, y = Variable)) +
+  geom_segment(aes(x = Lower_CI, xend = Upper_CI, y = Variable, yend = Variable),
+               color = "black", size = 0.5) +
+  geom_errorbarh(aes(xmin = Lower_CI, xmax = Upper_CI, y = Variable),
+                 height = 0.2, color = "black", size = 0.5, show.legend = FALSE) +
+  geom_segment(aes(x = -4, xend = 4, y = 0, yend = 0),
+               color = "black", linetype = "solid", size = 0.5) +
+  geom_vline(xintercept = 0, linetype = "solid", size = 0.3) +
+  geom_point(aes(shape = factor(sign(Beta_Values)), fill = factor(sign(Beta_Values))),
+             size = 5, color = "black") +
+  geom_text(aes(label = paste(sprintf("%.3f", Beta_Values), "[", sprintf("%.3f", Lower_CI), ",", sprintf("%.3f", Upper_CI), "]")),
+            x = 4, hjust = 0, size = 3, vjust = 0.5, nudge_x = 0.1, family = "Times New Roman", fontface = "bold", color = "black") +
+  labs(x = "Beta Value", y = "Variable") +
+  scale_shape_manual(values = c(22, 21), labels = c("Negative", "Positive")) +
+  scale_fill_manual(values = c("red", "red"), labels = c("Negative", "Positive")) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        plot.margin = margin(0, 1, 0, 0, "cm"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line.y = element_blank(),
+        text = element_text(family = "Times New Roman", face = "bold", color = "black")) +
+  coord_cartesian(xlim = c(-4, 8)) +
+  scale_x_continuous(breaks = seq(-4, 4, 2), limits = c(-4, 4))
+```
+
+
+重新定义有效变量，去除可信区间包含0的变量
+```{r 重新定义有效变量，去除可信区间包含0的变量}
+#significant_variables <- setdiff(significant_variables, c("既往一过性失明_视力下降_视物模糊", "出院_睡眠呼吸暂停综合征"))
+significant_variables<-c(significant_variables,"age_enrolled")
+save(significant_variables,file="~/建模/Data/significant_variables.rdata")
+
+```
+
+
+可视化变量之间的相关系数
+```{r 可视化变量之间的相关系数}
+library(dplyr)
+# 从数据集中提取significant_variables的子集
+subset_data <- data[, significant_variables]
+
+# 将非数值型的变量转换为数值型
+subset_data <- sapply(subset_data, as.numeric)
+
+# 计算相关系数矩阵
+cor_matrix <- cor(subset_data)
+
+# 可视化相关系数矩阵
+library(ggplot2)
+library(reshape2)
+
+cor_matrix_melted <- melt(cor_matrix)
+
+# 过滤对角线以下的数据
+cor_matrix_melted <- cor_matrix_melted %>%
+  filter(row_number() < match(Var1, Var2)) %>%
+  mutate(xmin = as.integer(as.factor(Var1)) - 0.5,
+         xmax = as.integer(as.factor(Var1)) + 0.5,
+         ymin = as.integer(as.factor(Var2)) - 0.5,
+         ymax = as.integer(as.factor(Var2)) + 0.5)
+
+# 创建绘图对象
+ggplot(cor_matrix_melted, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, limit = c(-1, 1), name = "Correlation") +
+  geom_text(aes(label = ifelse(abs(value) > 0.3 & value <= 1, round(value, 2), "")),
+            color = "black",
+            size = 3,
+            family = "Times New Roman") +
+  geom_rect(aes(xmin = xmin - 1, xmax = xmax - 1, ymin = ymin, ymax = ymax), color = "gray", fill = NA, size = 0.2) +  # 添加灰色边框，向左移一个单元格距离
+  labs(x = "Variable 1", y = "Variable 2", title = "Correlation Matrix") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank()) +
+  coord_fixed() +
+  scale_x_discrete(expand = c(0, 0)) +
+  scale_y_discrete(expand = c(0, 0))
+
+```
+
+如果有数值型变量，可以参考下列方式看数据之间的相关性
+```{r 如果有数值型变量，可以参考下列方式看数据之间的相关性}
+#library(PerformanceAnalytics)
+
+#cor_data <- data[, c("Outcome", significant_variables)]
+# 将非数值型的变量转换为数值型
+#cor_data <- sapply(cor_data, as.numeric)
+#chart.Correlation(cor_data, histogram = TRUE, method = "pearson", pch = 19)
+```
+
+
+方法二：最优子集回归（全子集回归）筛选变量
+```{r 方法二：最优子集回归（全子集回归）筛选变量}
+# 提取包含 Outcome 和 significant_variables 的子集数据
+subset<- data[, c("Outcome", significant_variables)]
+
+# 运行回归子集选择
+leaps <- regsubsets(Outcome ~ ., data = subset)
+
+# 获取摘要统计信息
+summary_leaps <- summary(leaps)
+
+#按照最优子集回归模型评价标准找到最佳组合
+which.min(summary_leaps$cp)#马洛斯CP最小值
+which.max(summary_leaps$adjr2) #调整R2最大值
+which.min(summary_leaps$bic) #贝叶斯信息准则最小值
+
+plot(leaps,scale="adjr2")
+
+# 获取最优子集的变量索引
+best_vars <- summary_leaps$which[which.min(summary_leaps$cp), ]
+best_vars <- best_vars[-1]  # 去除截距变量索引
+
+# 获取原始数据集中对应的变量名称（去掉 "Outcome" 列）
+variable_names <- names(subset)[-1][best_vars]
+
+BSR_variable_combinations<-variable_names
+
+BSR_variable_combinations
+
+save(BSR_variable_combinations,file="~/建模/Data/BSR_variable_combinations.rdata")
+
+#sum <- summary(leaps)
+
+# 查看adjr2的值
+#adjr2_values <- sum$adjr2
+
+# 查看每个变量组合对应的变量名称
+#variable_combinations <- apply(sum$which, 1, function(x) {
+  #colnames(sum$which)[x]
+#})
+
+# 将 variable_combinations 转换为字符向量
+#variable_combinations <- sapply(variable_combinations, paste, collapse = ", ")
+
+# 创建一个数据框来存储 adjr2 值和变量组合
+#best_combinations <- data.frame(ADJR2 = adjr2_values, Variable_Combinations = variable_combinations)
+
+
+# 按照adjr2值降序排列
+#best_combinations <- best_combinations[order(best_combinations$ADJR2, decreasing = TRUE), ]
+
+# 打印最佳变量组合
+#print(best_combinations)
+
+```
+
+方法三：LASSO回归+交叉验证 筛选变量  
+1. 所有变量都为数字格式；
+2. 做lasso前必须将数据框变为矩阵
+```{r 方法三：LASSO回归+交叉验证 筛选变量 }
+LASSO_subset<- data[, c("Outcome", significant_variables)]
+# 将除了"Outcome"列之外的所有变量转换为数字格式
+LASSO_subset[, -1] <- apply(LASSO_subset[, -1], 2, as.numeric)
+library(glmnet)
+str(LASSO_subset)
+
+# 将数据框转换为矩阵
+LASSO_matrix <- as.matrix(LASSO_subset[, -1])  # 排除第一列 Outcome
+
+# 提取因变量
+outcome <- LASSO_subset$Outcome
+
+# 执行 LASSO 逻辑回归
+lasso_model <- glmnet(LASSO_matrix, outcome, family = "binomial", alpha = 1)
+
+# 绘制 LASSO 系数路径图
+plot(lasso_model, xvar = "lambda", label = TRUE)
+
+# 通过交叉验证选择最优 lambda 值
+cv_model <- cv.glmnet(LASSO_matrix, outcome, family = "binomial", alpha = 1)
+plot(cv_model)
+
+ridge.coef1 <- predict(lasso_model, s=cv_model$lambda.1se, type = "coefficients")
+ridge.coef2 <- predict(lasso_model, s=cv_model$lambda.min, type = "coefficients")
+
+# 提取最优模型的变量名称
+LASSO_variable_combinations <- rownames(ridge.coef1)[ridge.coef1[, "s1"] != 0][-1]
+LASSO_variable_combinations <- rownames(ridge.coef2)[ridge.coef2[, "s1"] != 0][-1]
+
+LASSO_variable_combinations
+save(LASSO_variable_combinations,file="~/建模/Data/LASSO_variable_combinations.rdata")
+```
+
+
+
+取交集确定最终变量
+```{r 取交集确定最终变量}
+# candidate_variables <- intersect(LASSO_variable_combinations, BSR_variable_combinations)
+candidate_variables<-LASSO_variable_combinations
+save(candidate_variables,file="~/建模/Data/candidate_variables.rdata")
+```
+
+
+列出所有分类机器学习模型
+```{r 列出所有分类机器学习模型}
+library(caret)
+
+# 获取所有模型的信息
+all_models <- getModelInfo()
+
+classification_models <- list()
+
+for (model_name in names(all_models)) {
+  model <- all_models[[model_name]]
+  if ("Classification" %in% model$type) {
+    classification_models[[model_name]] <- model
+  }
+}
+
+
+# 创建一个空的数据框
+classification_table <- data.frame(Name = character(),
+                                   Type = character(),
+                                   Library = character(),
+                                   Parameters = character(),
+                                   Tags = character(),
+                                   stringsAsFactors = FALSE)
+
+# 遍历classification_models中的模型
+for (model_name in names(classification_models)) {
+  model <- classification_models[[model_name]]
+  
+  # 提取模型的属性，并添加到数据框中
+  model_data <- data.frame(
+    Name = model_name,
+    Type = model$type,
+    Library = paste(model$library, collapse = ", "),
+    Parameters = paste(model$parameters$parameter, collapse = ", "),
+    Tags = paste(model$tags, collapse = ", "),
+    stringsAsFactors = FALSE
+  )
+  
+  # 将模型的属性添加到数据框中
+  classification_table <- rbind(classification_table, model_data)
+}
+
+dim(classification_table)
+# 删除Type列为Regression的模型
+classification_table <- classification_table[classification_table$Type != "Regression", ]
+dim(classification_table)
+
+```
+
+
+总共有191个做分类的包
+```{r 总共有191个做分类的包}
+dim(classification_table)
+length(classification_table$Name)
+
+save(classification_table,file="~/建模/Data/classification_table.rdata")
+```
+
+
+单个样本测试代码，不运行
+```{r 单个样本测试代码，不运行}
+library(caret)
+
+# Rename the levels to valid variable names
+levels(discover_queue$Outcome) <- c("No", "Yes")
+
+# Run the train function again
+fitControl <- trainControl(method = "repeatedcv",
+                           number = 10,
+                           repeats = 10,
+                           classProbs = TRUE,
+                           summaryFunction = twoClassSummary)
+
+i<-76
+
+set.seed(i)
+load("~/建模/Data/available_seeds.rdata")
+method <- available_seeds$模型名字[available_seeds$seed == i]
+
+Fit1 <- train(Outcome ~ ., 
+              data = discover_queue[, c("Outcome", candidate_variables)], 
+              method = method, 
+              trControl = fitControl,
+              metric = "ROC")
+
+Fit1
+
+```
+
+单个样本测试代码，不运行
+计算训练集AUC和可信区间
+```{r 单个样本测试代码，不运行 计算训练集AUC和可信区间}
+library(pROC)
+pred_training <- predict(Fit1, newdata = discover_queue[, c("Outcome", candidate_variables)], type = "prob")
+
+# 计算训练集AUC
+roc_training <- roc(discover_queue$Outcome, pred_training[, "Yes"])
+auc_training <- auc(roc_training)
+
+auc_training
+
+auc_ci <- ci(auc_training)
+auc_ci
+
+# 获取AUC最大时的阈值
+coords_training <- coords(roc_training, "best")
+
+coords_training
+```
+
+单个样本测试代码，不运行
+计算测试集AUC和可信区间
+```{r 单个样本测试代码，不运行 计算测试集AUC和可信区间}
+
+library(pROC)
+pred_validation <- predict(Fit1, newdata = validation_queue[, c("Outcome", candidate_variables)], type = "prob")
+
+# 计算测试集AUC
+roc_validation <- roc(validation_queue$Outcome, pred_training[, "Yes"])
+auc_validation <- auc(roc_validation)
+
+auc_validation
+
+auc_ci <- ci(validation)
+auc_ci
+
+# 获取AUC最大时的阈值
+coords_validation <- coords(validation, "best")
+
+coords_validation
+
+```
+
+查看有多少用于分类的包
+```{r 查看有多少用于分类的包}
+head(classification_table)
+dim(classification_table) #  191   5
+```
+
+最终可用于分析的模型，数据已存储，不用运行
+```{r 最终可用于分析的模型，数据已存储，不用运行}
+available_seeds <- data.frame(模型名字 = available_models$模型名字,seed = available_models$seed)
+save(available_seeds,file="~/建模/Data/available_seeds.rdata")
+dim(available_seeds)
+```
+
+
+遍历所有模型
+```{r 遍历所有模型}
+library(doParallel)
+closeAllConnections()
+cl <- makePSOCKcluster(32)
+registerDoParallel(cl)
+
+# 创建空列表保存结果
+results <- list()
+fit_models <- list()  # 保存训练好的模型
+
+fitControl <- trainControl(method = "repeatedcv",
+                           number = 10,
+                           repeats = 10,
+                           classProbs = TRUE,
+                           summaryFunction = twoClassSummary)
+
+# Rename the levels to valid variable names
+levels(discover_queue$Outcome) <- c("No", "Yes")
+
+# 遍历 available_seeds 中的每个模型
+for (i in 1:nrow(available_seeds)) {
+  model_name <- available_seeds$模型名字[i]
+  fit_name <- paste(model_name, "Fit", sep = "_")
+  
+  seed <- available_seeds$seed[i]  # 获取种子的值
+  
+  set.seed(seed) 
+  tryCatch({
+    assign(fit_name, train(Outcome ~ ., 
+                           data = discover_queue[, c("Outcome", candidate_variables)], 
+                           method = model_name, 
+                           trControl = fitControl,
+                           metric = "ROC"))
+    
+    # 获取训练集AUC及其可信区间
+    pred_training <- predict(get(fit_name), newdata = discover_queue[, c("Outcome", candidate_variables)], type = "prob")
+    roc_training <- roc(discover_queue$Outcome, pred_training[, "Yes"])
+    auc_training <- auc(roc_training)
+    auc_ci_training <- ci(auc_training)
+    
+    # 获取验证集AUC及其可信区间
+    pred_validation <- predict(get(fit_name), newdata = validation_queue[, c("Outcome", candidate_variables)], type = "prob")
+    roc_validation <- roc(validation_queue$Outcome, pred_validation[, "Yes"])
+    auc_validation <- auc(roc_validation)
+    auc_ci_validation <- ci(auc_validation)
+    
+    # 保存结果到列表中
+    result <- c(model_name, fit_name, auc_training, auc_ci_training[1],  
+                auc_ci_training[3], auc_validation, auc_ci_validation[1], auc_ci_validation[3], seed)  # 将种子值添加到结果中
+    
+    results[[i]] <- result
+    fit_models[[fit_name]] <- get(fit_name)  # 保存训练好的模型
+    
+  }, error = function(e) {
+    warning(paste("Error encountered for model", model_name, ". Skipping this model."))
+  })
+}
+
+# 将结果列表转化为数据框
+results_df <- do.call(rbind, results)
+
+# 设置列名
+colnames(results_df) <- c("模型名字", "fit_name", "训练集AUC", "训练集AUC可信区间下限",
+                          "训练集AUC可信区间上限", "验证集AUC", "验证集AUC可信区间下限", "验证集AUC可信区间上限", "seed")  # 添加"seed"列名
+
+# 保存结果数据框
+save(results_df, file = "~/建模/Data/results_df.rdata")
+
+results_df<-data.frame(results_df)
+
+# 计算P值
+best_model <- results_df[which.max(results_df$验证集AUC), "fit_name"]
+reference_roc_training <- roc(discover_queue$Outcome, predict(get(best_model), newdata = discover_queue[, c("Outcome", candidate_variables)], type = "prob")[, "Yes"])
+reference_roc_validation <- roc(validation_queue$Outcome, predict(get(best_model), newdata = validation_queue[, c("Outcome", candidate_variables)], type = "prob")[, "Yes"])
+
+# 计算训练集AUC与最佳模型的P值
+results_df$p_value_train <- sapply(results_df$fit_name, function(fit_name) {
+  if (fit_name != best_model) {
+    model_roc <- roc(discover_queue$Outcome, predict(get(fit_name), newdata = discover_queue[, c("Outcome", candidate_variables)], type = "prob")[, "Yes"])
+    p_value <- roc.test(reference_roc_training, model_roc)$p.value
+    return(p_value)
+  } else {
+    return(NA)  # 最佳模型与自身比较，返回 NA
+  }
+})
+
+
+# 计算验证集AUC与最佳模型的P值
+results_df$p_value_val <- sapply(results_df$fit_name, function(fit_name) {
+  if (fit_name != best_model) {
+    model_roc <- roc(validation_queue$Outcome, predict(get(fit_name), newdata = validation_queue[, c("Outcome", candidate_variables)], type = "prob")[, "Yes"])
+    p_value <- roc.test(reference_roc_validation, model_roc)$p.value
+    return(p_value)
+  } else {
+    return(NA)  # 最佳模型与自身比较，返回 NA
+  }
+})
+
+
+# 设置新的列名
+colnames(results_df) <- c("模型名字", "fit_name", "训练集AUC", "训练集AUC可信区间下限",
+                          "训练集AUC可信区间上限", "验证集AUC", "验证集AUC可信区间下限", "验证集AUC可信区间上限",
+                          "seed", "p_value_train", "p_value_val")
+
+# 保存结果数据框
+save(results_df, file = "~/建模/Data/results_df.rdata")
+
+# 保存训练好的模型列表
+save(fit_models, file = "~/建模/Data/fit_models.rdata")
+
+# 停止并行计算
+stopCluster(cl)
+
+```
+
+
+
+stepAIC 建模
+```{r stepAIC 建模}
+stepAIC_model <- glm(Outcome ~ ., data = discover_queue[, c("Outcome", candidate_variables)], family = "binomial")
+
+# 使用stepAIC进行逐步选择变量
+glm_step_all <- stepAIC(stepAIC_model, direction = "backward")
+
+# 打印结果
+summary(glm_step_all)
+
+remain_variables <-  c("失明或视物能力下降","脉搏弱或无脉","肾动脉","髂总动脉","冠状动脉","age_enrolled")
+
+stepAIC_model2 <- glm(Outcome ~ ., data = discover_queue[, c("Outcome", remain_variables)], family = "binomial")
+
+# 使用stepAIC进行逐步选择变量
+glm_step <- stepAIC(stepAIC_model2, direction = "backward")
+
+# 打印结果
+summary(glm_step)
+
+
+# 获取训练集AUC及其可信区间
+pred_training <- predict(glm_step, newdata = discover_queue[, c("Outcome", candidate_variables)])
+roc_training <- roc(discover_queue$Outcome, pred_training)
+auc_training <- auc(roc_training)
+auc_training
+auc_ci_training <- ci(auc_training)
+auc_ci_training
+
+# 获取验证集AUC及其可信区间
+pred_validation <- predict(glm_step, newdata = validation_queue[, c("Outcome", candidate_variables)])
+roc_validation <- roc(validation_queue$Outcome, pred_validation)
+auc_validation <- auc(roc_validation)
+auc_validation
+auc_ci_validation <- ci(auc_validation)
+auc_ci_validation
+
+# 计算P值
+best_model <- results_df[which.max(results_df$验证集AUC), "fit_name"]
+reference_roc_training <- roc(discover_queue$Outcome, predict(fit_models[[best_model]], newdata = discover_queue[, c("Outcome", candidate_variables)], type = "prob")[, "Yes"])
+reference_roc_validation <- roc(validation_queue$Outcome, predict(fit_models[[best_model]], newdata = validation_queue[, c("Outcome", candidate_variables)], type = "prob")[, "Yes"])
+
+p_value_train <- roc.test(reference_roc_training, roc_training)$p.value
+p_value_train
+
+p_value_test<-roc.test(reference_roc_validation, roc_validation)$p.value
+p_value_test
+
+```
+
+
+
+森林图展示训练和验证集AUC
+```{r 森林图展示训练和验证集AUC}
+library(ggplot2)
+
+# 按照验证集AUC降序排列
+results_df$验证集AUC <- as.numeric(results_df$验证集AUC)
+results_df$验证集AUC可信区间下限 <- as.numeric(results_df$验证集AUC可信区间下限)
+results_df$验证集AUC可信区间上限 <- as.numeric(results_df$验证集AUC可信区间上限)
+results_df$训练集AUC <- as.numeric(results_df$训练集AUC)
+results_df$训练集AUC可信区间下限 <- as.numeric(results_df$训练集AUC可信区间下限)
+results_df$训练集AUC可信区间上限 <- as.numeric(results_df$训练集AUC可信区间上限)
+
+results_df <- results_df[order(-results_df$验证集AUC), ]
+
+results_df$模型名字 <- factor(results_df$模型名字, levels = results_df$模型名字)
+
+results_df_top10<-head(results_df,20)
+
+results_df_top10<- results_df_top10[order(results_df_top10$验证集AUC), ]
+results_df_top10$模型名字 <- factor(results_df_top10$模型名字, levels = results_df_top10$模型名字)
+
+
+ggplot(results_df_top10 , aes(x = 验证集AUC, y = 模型名字)) +
+  geom_segment(aes(x = 验证集AUC可信区间下限, xend = 验证集AUC可信区间上限, y = 模型名字, yend = 模型名字),
+               color = "black", size = 0.5) +
+  geom_errorbarh(aes(xmin = 验证集AUC可信区间下限, xmax = 验证集AUC可信区间上限, y = 模型名字),
+                 height = 0.2, color = "black", size = 0.5, show.legend = FALSE) +
+  geom_segment(aes(x = 0, xend = 1, y = 0, yend = 0),
+               color = "black", linetype = "solid", size = 0.5) +
+  geom_vline(xintercept = 0.5, linetype = "solid", size = 0.3) +
+  geom_point(aes(shape = factor(sign(验证集AUC)), fill = factor(sign(验证集AUC))),
+             size = 5, color = "black") +
+  geom_text(aes(label = paste(sprintf("%.3f", 验证集AUC), "[", sprintf("%.3f", 验证集AUC可信区间下限), ",", sprintf("%.3f", 验证集AUC可信区间上限), "]")),
+            x = 1, hjust = 0, size = 3, vjust = 0.5, nudge_x = 0.1, family = "Times New Roman", fontface = "bold", color = "black") +
+  labs(x = "验证集AUC", y = "模型名字") +
+  scale_shape_manual(values = c(22, 21), labels = c("负", "正")) +
+  scale_fill_manual(values = c("red", "red"), labels = c("负", "正")) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        plot.margin = margin(0, 2, 0, 0, "cm"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line.y = element_blank(),
+        text = element_text(family = "Times New Roman", face = "bold", color = "black")) +
+  coord_cartesian(xlim = c(0, 2)) +
+  scale_x_continuous(breaks = seq(0, 2, 0.1), limits = c(0, 2))
+
+
+
+ggplot(results_df_top10 , aes(x = 训练集AUC, y = 模型名字)) +
+  geom_segment(aes(x = 训练集AUC可信区间下限, xend = 训练集AUC可信区间上限, y = 模型名字, yend = 模型名字),
+               color = "black", size = 0.5) +
+  geom_errorbarh(aes(xmin = 训练集AUC可信区间下限, xmax = 训练集AUC可信区间上限, y = 模型名字),
+                 height = 0.2, color = "black", size = 0.5, show.legend = FALSE) +
+  geom_segment(aes(x = 0, xend = 1, y = 0, yend = 0),
+               color = "black", linetype = "solid", size = 0.5) +
+  geom_vline(xintercept = 0.5, linetype = "solid", size = 0.3) +
+  geom_point(aes(shape = factor(sign(训练集AUC)), fill = factor(sign(训练集AUC))),
+             size = 5, color = "black") +
+  geom_text(aes(label = paste(sprintf("%.3f", 训练集AUC), "[", sprintf("%.3f", 训练集AUC可信区间下限), ",", sprintf("%.3f", 训练集AUC可信区间上限), "]")),
+            x = 1.2, hjust = 0, size = 3, vjust = 0.5, nudge_x = 0.1, family = "Times New Roman", fontface = "bold", color = "black") +
+  labs(x = "训练集AUC", y = "模型名字") +
+  scale_shape_manual(values = c(22, 21), labels = c("负", "正")) +
+  scale_fill_manual(values = c("blue", "red"), labels = c("负", "正")) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        plot.margin = margin(0, 2, 0, 0, "cm"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line.y = element_blank(),
+        text = element_text(family = "Times New Roman", face = "bold", color = "black")) +
+  coord_cartesian(xlim = c(0, 2)) +
+  scale_x_continuous(breaks = seq(0, 2, 0.1), limits = c(0, 2))
+```
+
+
+
+可视化机器学习变量
+```{r 可视化机器学习变量}
+library(xgboost)
+library(shapviz)
+
+xgbdata<-discover_queue[, c("Outcome", candidate_variables)]
+
+# 将 Outcome 列转换为数值类型
+xgbdata$Outcome <- as.numeric(as.character(xgbdata$Outcome))
+
+dtrain <- xgb.DMatrix(data.matrix(xgbdata[candidate_variables]), label = xgbdata$Outcome)
+
+fit_models$xgbTree_Fit$finalModel
+
+param <- list(
+  eta = "0.3",
+  max_depth = "1",
+  gamma = "0",
+  colsample_bytree = "0.6",
+  min_child_weight = "1",
+  subsample = "1"
+  #objective = "binary:logistic"
+)
+
+fit <- xgb.train(params = list(eta = param$eta
+                               #max_depth = param$max_depth
+                                 #gamma = param$gamma,
+                               #colsample_bytree = param$colsample_bytree
+                                 #min_child_weight = param$min_child_weight, 
+                               #subsample = param$subsample
+                               ), data = dtrain, nrounds = 50)
+
+# 预测概率
+xgbdata_test<-validation_queue[, c("Outcome", candidate_variables)]
+
+dtrain_test <- xgb.DMatrix(data.matrix(xgbdata_test[candidate_variables]), label = xgbdata_test$Outcome)
+
+pred_val <- predict(fit, newdata = dtrain_test, type = "prob")
+
+roc_training <- roc(xgbdata_test$Outcome,pred_val)
+auc_training <- auc(roc_training)
+auc_training
+auc_ci_training <- ci(auc_training)
+auc_ci_training
+
+
+# Explanation data
+xgb_test<-validation_queue[, c("Outcome", candidate_variables)]
+
+shp <- shapviz(fit, X_pred = data.matrix(xgb_test[candidate_variables]), X = xgb_test)
+
+sv_waterfall(shp, row_id = 4)
+
+sv_force(shp, row_id = 4)
+
+sv_importance(shp)
+
+sv_importance(shp, kind = "beeswarm")
+
+```
+
+
+Calibration plots训练集绘制
+```{r Calibration plots训练集绘制}
+library(predtools)
+library(dplyr)
+
+dev_data <- discover_queue[, c("Outcome", candidate_variables)]
+#dev_data <- validation_queue[, c("Outcome", candidate_variables)]
+
+dev_data$Outcome <- as.numeric(dev_data$Outcome)
+dev_data$Outcome <- ifelse(dev_data$Outcome == 1, 0, 1)
+
+n <-5  # 指定选择的模型个数
+
+top_models <- results_df %>% top_n(n, 验证集AUC)
+model_names <- top_models$fit_name
+
+predictions <- vector("list", length = n)
+
+for (i in 1:n) {
+  model <- model_names[i]
+  predictions[[i]] <- predict(fit_models[[model]], newdata = dev_data, type = "prob")[, "Yes"]
+}
+
+dev_data_combined <- data.frame(
+  Outcome = dev_data$Outcome,
+  model = rep(model_names, each = nrow(dev_data)),
+  predictions = unlist(predictions)
+)
+
+calibration_plot_my(
+  obs = "Outcome",
+  pred = "predictions",
+  data = dev_data_combined,
+  group = "model",
+  nTiles = 4
+)
+
+calibration_curve_plot_my(
+  obs = "Outcome",
+  pred = "predictions",
+  data = dev_data_combined,
+  group = "model",
+  nTiles = 3
+)
+
+```
+
+
+Calibration plots验证集绘制
+```{r Calibration plots验证集绘制}
+library(predtools)
+
+#dev_data <- discover_queue[, c("Outcome", candidate_variables)]
+dev_data <- validation_queue[, c("Outcome", candidate_variables)]
+
+dev_data$Outcome <- as.numeric(dev_data$Outcome)
+dev_data$Outcome <- ifelse(dev_data$Outcome == 1, 0, 1)
+
+n <-5  # 指定选择的模型个数
+
+top_models <- results_df %>% top_n(n, 验证集AUC)
+model_names <- top_models$fit_name
+
+predictions <- vector("list", length = n)
+
+for (i in 1:n) {
+  model <- model_names[i]
+  predictions[[i]] <- predict(fit_models[[model]], newdata = dev_data, type = "prob")[, "Yes"]
+}
+
+dev_data_combined <- data.frame(
+  Outcome = dev_data$Outcome,
+  model = rep(model_names, each = nrow(dev_data)),
+  predictions = unlist(predictions)
+)
+
+calibration_plot_my(
+  obs = "Outcome",
+  pred = "predictions",
+  data = dev_data_combined,
+  group = "model",
+  nTiles = 4
+)
+
+calibration_curve_plot_my(
+  obs = "Outcome",
+  pred = "predictions",
+  data = dev_data_combined,
+  group = "model",
+  nTiles = 3
+)
+
+```
+
+
+```{r 计算Brier分数}
+
+library(plyr)
+library(dplyr)
+
+dev_data <- validation_queue[, c("Outcome", candidate_variables)]
+
+n <- 15  # 指定选择的模型个数
+#n <- sum(results_df$p_value_val >= 0.05 | is.na(results_df$p_value_val)) # 指定所有五差异的模型
+
+top_models <- results_df %>% top_n(n, 验证集AUC)
+model_names <- top_models$fit_name
+
+
+# 计算Brier分数
+brier_scores <- c()
+
+for (i in 1:n) {
+  model <- model_names[i]
+  predicted_probs <- predict(fit_models[[model]], newdata = dev_data, type = "prob")[, "Yes"]
+  actual_outcomes <- ifelse(as.numeric(dev_data$Outcome) == 1, 0, 1)
+  brier_score <- mean((actual_outcomes - predicted_probs)^2)
+  brier_scores <- c(brier_scores, brier_score)
+}
+
+# 找到Brier分数最小的模型作为参考模型
+reference_index <- which.min(brier_scores)
+reference_model <- model_names[reference_index]
+reference_preds <- predict(fit_models[[reference_model]], newdata = dev_data, type = "prob")[, "Yes"]
+reference_actuals <- ifelse(as.numeric(dev_data$Outcome) == 1, 0, 1)
+reference_brier <- mean((reference_actuals - reference_preds)^2)
+
+# 创建一个空的数据框来存储结果
+brier_table <- data.frame(Model = character(),
+                          Brier_Score = numeric(),
+                          Lower_CI = numeric(),
+                          Upper_CI = numeric(),
+                          P_Value = numeric(),
+                          stringsAsFactors = FALSE)
+
+# 循环计算每个模型的Brier分数和可信区间，并计算P值
+for (i in 1:n) {
+  model <- model_names[i]
+  predicted_probs <- predict(fit_models[[model]], newdata = dev_data, type = "prob")[, "Yes"]
+  actual_outcomes <- ifelse(as.numeric(dev_data$Outcome) == 1, 0, 1)
+  
+  # 计算Brier分数
+  brier_score <- mean((actual_outcomes - predicted_probs)^2)
+  
+  # 计算可信区间
+  bootstrap_scores <- replicate(1000, {
+    sampled_indices <- sample(1:length(predicted_probs), replace = TRUE)
+    sampled_actuals <- actual_outcomes[sampled_indices]
+    sampled_preds <- predicted_probs[sampled_indices]
+    mean((sampled_actuals - sampled_preds)^2)
+  })
+  lower_ci <- quantile(bootstrap_scores, 0.025)
+  upper_ci <- quantile(bootstrap_scores, 0.975)
+  
+  # 计算与参考模型的P值
+  if (i != reference_index) {
+    reference_bootstrap_scores <- replicate(1000, {
+      sampled_indices <- sample(1:length(reference_preds), replace = TRUE)
+      sampled_actuals <- reference_actuals[sampled_indices]
+      sampled_preds <- reference_preds[sampled_indices]
+      mean((sampled_actuals - sampled_preds)^2)
+    })
+    p_value <- sum(reference_bootstrap_scores <= brier_score) / length(reference_bootstrap_scores)
+  } else {
+    p_value <- NA
+  }
+  
+  # 将结果添加到表格中
+  brier_table <- rbind(brier_table, data.frame(Model = model,
+                                               Brier_Score = brier_score,
+                                               Lower_CI = lower_ci,
+                                               Upper_CI = upper_ci,
+                                               P_Value = p_value,
+                                               stringsAsFactors = FALSE))
+}
+
+# 按Brier分数排序
+brier_table <- arrange(brier_table, Brier_Score)
+
+save(brier_table, file = "~/建模/Data/brier_table.rdata")
+
+```
+
+
+```{r 排名靠前的模型的brier分数可视化}
+
+# 将回归结果转换为数据框格式
+brier_result_df <- data.frame(Variable = brier_table$Model,
+                        Beta_Values = brier_table$Brier_Score,
+                        Lower_CI = brier_table$Lower_CI,
+                        Upper_CI = brier_table$Upper_CI,
+                        stringsAsFactors = FALSE)
+
+# 按照beta值从大到小排序
+brier_result_df <- brier_result_df[order(-brier_result_df$Beta_Values), ]
+#brier_result_df <- brier_result_df[order(brier_result_df$Beta_Values), ]
+
+# 将Variable变量转换为有序因子
+brier_result_df$Variable <- factor(brier_result_df$Variable, levels = brier_result_df$Variable)
+
+# 使用森林图进行可视化
+library(ggplot2)
+
+lower<-0
+upper<-0.2
+gap<-0.1
+word<-0.3
+
+ggplot(brier_result_df, aes(x = Beta_Values, y = Variable)) +
+  geom_segment(aes(x = Lower_CI, xend = Upper_CI, y = Variable, yend = Variable),
+               color = "black", size = 0.5) +
+  geom_errorbarh(aes(xmin = Lower_CI, xmax = Upper_CI, y = Variable),
+                 height = 0.2, color = "black", size = 0.5, show.legend = FALSE) +
+  geom_segment(aes(x = 0, xend = upper, y = 0, yend = 0),
+               color = "black", linetype = "solid", size = 0.5) +
+  geom_vline(xintercept = 0, linetype = "solid", size = 0.3) +
+  geom_point(aes(shape = factor(sign(Beta_Values)), fill = factor(sign(Beta_Values))),
+             size = 5, color = "black") +
+  geom_text(aes(label = paste(sprintf("%.3f", Beta_Values), "[", sprintf("%.3f", Lower_CI), ",", sprintf("%.3f", Upper_CI), "]")),
+            x = word, hjust = 0, size = 3, vjust = 0.5, nudge_x = 0.1, family = "Times New Roman", fontface = "bold", color = "black") +
+  labs(x = "Beta Value", y = "Variable") +
+  scale_shape_manual(values = c(22, 21), labels = c("Negative", "Positive")) +
+  scale_fill_manual(values = c("red", "red"), labels = c("Negative", "Positive")) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        plot.margin = margin(0, 1, 0, 0, "cm"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.line.y = element_blank(),
+        text = element_text(family = "Times New Roman", face = "bold", color = "black")) +
+  coord_cartesian(xlim = c(0, 1)) +
+  scale_x_continuous(breaks = seq(lower, upper, gap), limits = c(lower, upper))
+
+```
+
+
+
+```{r ROC图像绘制}
+library(pROC)
+
+#data_ROC<-discover_queue # 训练集绘制
+data_ROC<-validation_queue # 验证集绘制
+
+n <- 5  # 设置要展示的模型数量
+
+# 按照验证集AUC从大到小排序选择前n个模型
+sorted_results <- results_df[order(results_df$验证集AUC, decreasing = TRUE), ]
+top_models <- sorted_results$fit_name[1:n]
+
+# 创建一个列表存储每个模型的ROC曲线数据和AUC信息
+roc_data_list <- vector("list", n)
+auc_list <- vector("list", n)
+ci_list <- vector("list", n)
+
+# 计算每个模型的ROC曲线数据和AUC信息并进行平滑处理
+for (i in 1:n) {
+  model <- fit_models[[top_models[i]]]
+  pred <- predict(model, newdata = data_ROC[, c("Outcome", candidate_variables)], type = "prob")
+  roc_data <- roc(data_ROC$Outcome, pred$Yes)
+  roc_data_list[[i]] <- roc_data
+  auc_list[[i]] <- auc(roc_data)
+  ci_list[[i]] <- ci.auc(roc_data)
+}
+
+# 创建一个数据框来存储所有模型的ROC曲线数据、AUC和可信区间
+roc_df <- data.frame()
+smoothed_roc_df <- data.frame()
+for (i in 1:n) {
+  roc_data <- roc_data_list[[i]]
+  auc <- auc_list[[i]]
+  ci <- ci_list[[i]]
+  smoothed_roc <- smooth(roc_data, method = "density")
+  #使用核密度估计方法进行平滑。该方法基于数据的密度估计，通过核函数对数据进行平滑处理。
+  # 应用平滑方法
+  #smoothed_roc <- smooth(roc_data, method = "binormal")
+  #使用双正态分布拟合数据。该方法假设正例和反例的预测值分布都可以用正态分布来近似，并使用这两个正态分布的参数来平滑ROC曲线。
+  #smoothed_roc <- smooth(roc_data, method = "fitdistr")
+  #使用拟合分布方法进行平滑。该方法尝试拟合数据到一个给定的分布（如正态分布、指数分布等），然后根据拟合的分布进行平滑处理。
+  #smoothed_roc <- smooth(roc_data, method = "logcondens")
+  #使用对数密度比平滑方法。该方法基于对数密度比函数对数据进行平滑处理，其中对数密度比函数是衡量正例和反例的概率密度比的函数。
+  #smoothed_roc <- smooth(roc_data, method = "logcondens.smooth")
+  #使用平滑对数密度比方法。该方法是对"logcondens"方法的改进，通过对对数密度比函数进行平滑处理来得到平滑的ROC曲线。
+
+  roc_df <- rbind(roc_df, data.frame(Specificity = 1 - roc_data$specificities,
+                                     Sensitivity = roc_data$sensitivities,
+                                     Model = top_models[i],
+                                     AUC = round(auc, 3),
+                                     CI = paste0("[", round(ci[1], 3), ", ", round(ci[3], 3), "]")))
+  smoothed_roc_df <- rbind(smoothed_roc_df, data.frame(Specificity = 1 - smoothed_roc$specificities,
+                                                       Sensitivity = smoothed_roc$sensitivities,
+                                                       Model = top_models[i]))
+}
+
+# 绘制ROC曲线（包括平滑曲线）
+ggplot() +
+  #geom_line(data = roc_df, aes(x = Specificity, y = Sensitivity, color = Model)) +
+  geom_line(data = smoothed_roc_df, aes(x = Specificity, y = Sensitivity, color = Model), linetype = "solid") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "black") +
+  xlim(0, 1) +
+  ylim(0, 1) +
+  xlab("False Positive Rate") +
+  ylab("True Positive Rate") +
+  ggtitle("ROC Curve") +
+  theme(panel.border = element_rect(color = "black", fill = NA),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white")) +
+  scale_color_manual(values = rainbow(n), labels = top_models, guide = guide_legend())
+
+```
+
+
+制作Table1
+```{r 制作Table1}
+
+library(tableone)
+
+load("~/建模/Data/data.rdata")
+str(data)
+
+# 将所有变量（除 Group 外）赋值给 myVars
+myVars <- names(data)[names(data) != "Group"]
+
+# 初始化一个空向量用于存储分类变量
+catVars <- c()
+
+# 遍历所有变量，并检查是否为分类变量
+for (var in myVars) {
+  if (is.factor(data[[var]])) {
+    catVars <- c(catVars, var)
+  }
+}
+
+# 初始化一个空向量用于存储不服从正态分布的变量
+nonvar <- c()
+
+# 遍历所有变量，并进行正态性检验
+for (var in names(data)) {
+  if (is.numeric(data[[var]])) {
+    shapiro_result <- shapiro.test(data[[var]])
+    if (shapiro_result$p.value > 0.05) {
+      # 符合正态分布，不做任何操作
+    } else {
+      nonvar <- c(nonvar, var)
+    }
+  }
+}
+
+
+
+# 初始化一个空向量用于存储需要使用 Fisher 精确检验的变量
+exactvars <- c()
+
+# 遍历所有变量，并进行 Fisher 精确检验或卡方检验判断
+for (var in names(data)) {
+  if (is.factor(data[[var]])) {
+    table <- table(data[[var]])
+    n <- sum(table)
+    
+    # 检查是否满足条件1
+    if (n >= 40 && sum(table < 5) >= 2 && any(table < 5)) {
+      exactvars <- c(exactvars, var)
+    }
+    
+    # 检查是否满足条件2
+    if (n < 40 || any(table < 1)) {
+      exactvars <- c(exactvars, var)
+    }
+    
+  }
+}
+
+table <- CreateTableOne(vars = myVars, #条件1
+                        factorVars = catVars,#条件2
+                        strata = "Group", #条件4
+                        data = data, #原始数据
+                        addOverall = TRUE) #条件6加入overall
+
+
+table1<- print(table, #构建的table函数（带条件1.2.3）
+               nonnormal = nonvar,#条件4
+               exact = exactvars,#条件5
+               catDigits = 2,contDigits = 2,pDigits = 3, #附加条件
+               
+               showAllLevels=TRUE, #显示所有变量
+               quote = FALSE, # 不显示引号
+               noSpaces = TRUE, # #删除用于对齐的空格
+               printToggle = TRUE) #展示输出结果
+
+
+write.csv(table1, file = "~/建模/Data/table1.csv")
+
+
+# 将所有变量（除 Group 外）赋值给 myVars
+myVars_table2 <- names(data)[!(names(data) %in% c("Group", "Outcome"))]
+
+table2 <- CreateTableOne(vars = myVars_table2, #条件1
+                        factorVars = catVars,#条件2
+                        strata = "Outcome", #条件4
+                        data = data, #原始数据
+                        addOverall = TRUE) #条件6加入overall
+
+
+table2<- print(table2, #构建的table函数（带条件1.2.3）
+               nonnormal = nonvar,#条件4
+               exact = exactvars,#条件5
+               catDigits = 2,contDigits = 2,pDigits = 3, #附加条件
+               
+               showAllLevels=TRUE, #显示所有变量
+               quote = FALSE, # 不显示引号
+               noSpaces = TRUE, # #删除用于对齐的空格
+               printToggle = TRUE) #展示输出结果
+
+
+write.csv(table2, file = "~/建模/Data/table2.csv")
+
+
+table(data$Group)
+
+discover_data <- data[data$Group == "Discover", ]
+
+# 将所有变量（除 Group 外）赋值给 myVars
+myVars_table3 <- names(discover_data)[!(names(discover_data) %in% c("Group", "Outcome"))]
+
+table3 <- CreateTableOne(vars = myVars_table3, #条件1
+                         factorVars = catVars,#条件2
+                         strata = "Outcome", #条件4
+                         data = discover_data, #原始数据
+                         addOverall = TRUE) #条件6加入overall
+
+
+table3<- print(table3, #构建的table函数（带条件1.2.3）
+               nonnormal = nonvar,#条件4
+               exact = exactvars,#条件5
+               catDigits = 2,contDigits = 2,pDigits = 3, #附加条件
+               
+               showAllLevels=TRUE, #显示所有变量
+               quote = FALSE, # 不显示引号
+               noSpaces = TRUE, # #删除用于对齐的空格
+               printToggle = TRUE) #展示输出结果
+
+
+write.csv(table3, file = "~/建模/Data/table3.csv")
+
+
+
+table(data$Group)
+
+Validation_data <- data[data$Group == "Validation", ]
+
+# 将所有变量（除 Group 外）赋值给 myVars
+myVars_table4 <- names(Validation_data)[!(names(Validation_data) %in% c("Group", "Outcome"))]
+
+table4 <- CreateTableOne(vars = myVars_table4, #条件1
+                         factorVars = catVars,#条件2
+                         strata = "Outcome", #条件4
+                         data = Validation_data, #原始数据
+                         addOverall = TRUE) #条件6加入overall
+
+
+table4<- print(table4, #构建的table函数（带条件1.2.3）
+               nonnormal = nonvar,#条件4
+               exact = exactvars,#条件5
+               catDigits = 2,contDigits = 2,pDigits = 3, #附加条件
+               
+               showAllLevels=TRUE, #显示所有变量
+               quote = FALSE, # 不显示引号
+               noSpaces = TRUE, # #删除用于对齐的空格
+               printToggle = TRUE) #展示输出结果
+
+
+write.csv(table4, file = "~/建模/Data/table4.csv")
+
+```
+
+
+
+```{r 绘制DCA曲线}
+
+source("~/建模/Code/dca.r")
+library(reshape2)
+library(ggplot2)
+
+test_data <- discover_queue[, c("Outcome", candidate_variables)]
+#test_data <- validation_queue[, c("Outcome", candidate_variables)]
+
+test_data$Outcome <- as.numeric(test_data$Outcome)
+test_data$Outcome <- ifelse(test_data$Outcome == 1, 0, 1)
+
+n <- 5  # 指定选择的模型个数
+
+top_models <- results_df %>% top_n(n, 验证集AUC)
+model_names <- top_models$fit_name
+
+dca_results <- data.frame()  # 创建空的数据框
+
+# 循环计算每个模型的DCA输出结果，并存储数据
+for (i in 1:n) {
+  model <- model_names[[i]]
+  prob <- predict(fit_models[[model]], newdata = test_data, type = "prob")
+  prob <- data.frame("outcome" = test_data$Outcome, "model_prob" = as.data.frame(prob)$Yes)
+  
+  dcaoutput <- dca(data = prob, outcome = "outcome",
+                   predictors = c("model_prob"),
+                   xstart = 0, xstop = 1, ymin = 0)
+  dcadf <- data.frame(dcaoutput$net.benefit)
+  
+  temp <- melt(dcadf, id = "threshold", measure = c("model_prob", "all", "none"))
+  
+  # 添加模型标识列和颜色列
+  temp$model <- model_names[[i]]
+  
+  # 将当前模型的数据添加到总的数据框中
+  dca_results <- rbind(dca_results, temp)
+}
+
+
+save(dca_results,file="~/建模/Data/dca_results.rdata")
+write.csv(dca_results, file = "~/建模/Data/dca_results.csv")
+
+library(RColorBrewer)
+
+# 定义颜色调色板
+color_palette <- brewer.pal(n = length(unique(dca_results$model)), name = "Set1")
+#color_palette <- brewer.pal(n = length(unique(dca_results$model)), name = "Paired")
+
+# Sort unique model names alphabetically
+model_names <- sort(unique(dca_results$model))
+
+# Define colors for none and all
+none_color <- "red"
+all_color <- "black"
+
+# Assign colors from color_palette to the remaining model names
+model_colors <- color_palette[order(model_names)]
+
+# Create a named color vector
+color_vector <- c(none = none_color, all = all_color, setNames(model_colors, model_names))
+
+ggplot(dca_results, aes(x = threshold, y = value, linetype = model)) +
+  geom_line(data = subset(subset(dca_results, model == model_names[[1]]), variable != "model_prob"), aes(color = variable), linetype = "dashed", size = 0.5) +
+  geom_smooth(data = subset(dca_results, variable == "model_prob"), aes(color = model), method = "loess", se = FALSE, size = 0.7) +
+  coord_cartesian(xlim = c(0, 1), ylim = c(-0.05, max(dca_results$value, na.rm = TRUE))) +
+  labs(x = "Threshold probability (%)", y = "Net benefit") +
+  scale_color_manual(values = color_vector) +
+  scale_linetype_manual(values = rep("solid", length(unique(dca_results$model)))) +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.title = element_blank())
+
+```
+
+提取模型参数
+```{r 提取模型参数}
+library(dplyr)
+
+all_models <- getModelInfo()
+
+# 创建一个空的数据框
+model_table <- data.frame(
+  ModelName = character(),
+  Label = character(),
+  Library = character(),
+  Type = character(),
+  Parameters = character(),
+  stringsAsFactors = FALSE
+)
+
+# 遍历all_models中的每个模型
+for (model_name in names(all_models)) {
+  model_info <- all_models[[model_name]]
+  
+  # 获取模型的label
+  label <- model_info$label
+  
+  # 获取模型的library
+  library <- paste(model_info$library, collapse = ", ")
+  
+  # 获取模型的type
+  type <- paste(model_info$type, collapse = ", ")
+  
+  # 获取模型的parameters
+  parameters <- paste(model_info$parameters$parameter, collapse = ", ")
+  
+  # 将模型信息添加到数据框中
+  model_table <- model_table %>%
+    add_row(
+      ModelName = model_name,
+      Label = label,
+      Library = library,
+      Type = type,
+      Parameters = parameters
+    )
+}
+
+# 打印并查看表格
+model_table
+
+save(model_table,file="~/建模/Data/model_table.rdata")
+
+str(results_df)
+
+merged_df <- merge(results_df, model_table, by.x = "模型名字", by.y = "ModelName", all.x = TRUE)
+
+# 打印并查看合并后的数据框
+merged_df
+
+write.csv(merged_df, file = "~/建模/Data/merged_df.csv")
+
+
+
+# 创建一个空的数据框
+parameter_table <- data.frame(
+  ModelName = character(),
+  bestTune = character(),
+  stringsAsFactors = FALSE
+)
+
+# 遍历fit_models中的每个模型
+for (model_name in names(fit_models)) {
+  best_params <- fit_models[[model_name]]$bestTune
+  
+  # 将bestTune参数格式化为指定格式
+  best_params_formatted <- paste(names(best_params), "=", best_params, collapse = "； ")
+  
+  # 将模型名字和格式化后的bestTune参数添加到数据框中
+  parameter_table <- parameter_table %>%
+    add_row(
+      ModelName = model_name,
+      bestTune = best_params_formatted
+    )
+}
+
+# 打印并查看表格
+parameter_table
+
+write.csv(parameter_table, file = "~/建模/Data/parameter_table.csv")
+
+
+all_models_infor <- merge(merged_df, parameter_table, by.x = "fit_name", by.y = "ModelName", all.x = TRUE)
+
+# 打印并查看合并后的数据框
+all_models_infor
+
+write.csv(all_models_infor, file = "~/建模/Data/all_models_infor.csv")
+```
+
+
+
+
+
+
+
+
+
+
+
